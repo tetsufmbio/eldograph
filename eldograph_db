@@ -1,0 +1,719 @@
+#!/usr/bin/perl -w
+
+# ELDO maker
+
+use strict;
+use FindBin qw($Bin);
+use lib "$Bin/lib/perl5";
+use URI::Escape;
+use HTTP::Tiny;
+use XML::Simple qw(XMLin);
+use Getopt::Long;
+use Pod::Usage;
+use Data::Dumper;
+use Net::Wire10;
+use Parallel::ForkManager;
+use Storable;
+
+use Bio::TreeIO;
+use Bio::Tree::TreeFunctionsI;
+use Bio::Tree::TreeI;
+use Bio::Tree::NodeI;
+
+# inputs
+
+$| = (@ARGV > 0); 
+
+# setup my defaults
+
+my $version;
+my $eldoVersion = "ELDOgraph 1.0";
+my $treeDirectory;
+my $help;
+my $man;
+my $taxTable;
+my $outfile = "eldo_db.hash";
+my $delimiter;
+my $position;
+my $numThreads	= 1;
+my $localMySQL;
+
+GetOptions(
+    'treedir=s'=> \$treeDirectory,
+    'taxTable=s'    => \$taxTable,
+    'out=s'    => \$outfile,
+    'help!'     	=> \$help,
+	'version!'		=> \$version,
+	'man!'			=> \$man,
+	'delimiter=s'		=> \$delimiter,
+	'position=i'		=> \$position,
+	'numThreads=i'		=> \$numThreads,
+	'mysql!'		=> \$localMySQL
+) or pod2usage(-verbose => 99, 
+            -sections => [ qw(NAME SYNOPSIS) ] );
+
+pod2usage(0) if $man;
+pod2usage(2) if $help;
+if ($version){
+	print $eldoVersion."\n";
+	exit;
+}
+
+if (!$treeDirectory){
+	print "ERROR: -treedir not provided.\n";
+	pod2usage(2);
+}
+if (!$taxTable){
+	print "ERROR: -taxtable not provided.\n";
+	pod2usage(2);
+}
+
+# hash structure:
+
+my %hash_eldo;
+# all taxonomy information
+# hash_eldo{"taxonomy"}{"txid"}{$txid}{"taxSimpleLineage"} = $lineage
+# hash_eldo{"taxonomy"}{"code"}{$code} = $txid
+
+# hash_eldo{"distance"}{$file}{"taxonomy"}{"txid"}{$txid} = @listID --> list of leafid of $txid in the tree file
+# hash_eldo{"distance"}{$file}{"taxonomy"}{"code"}{$leafid}{"txid"} = $txid --> txid of each leafid in the tree file
+# hash_eldo{"distance"}{$file}{"taxonomy"}{"code"}{$leafid}{"pos"} = $pos --> position of each leafid in the distance matrix
+# hash_eldo{"distance"}{$file}{"leaf"} = @listID --> list of leaf ordered according to the distance matrix
+# hash_eldo{"distance"}{$file}{"matrix"} = @listID --> distance matrix ordered according to the list in "leaf"
+
+# parse taxTable
+
+my %map_txid;
+my %missingTxid;
+
+open (TABLE, "< $taxTable") or die "\nERROR: Can't open the file $_\n";
+while (my $line = <TABLE>){
+	my $error2 = 0;
+	chomp $line;
+	next if ($line eq "");
+	my @line = split(/\t/, $line);
+	if ($line[1] =~ /\D/){
+		print "NOTE: txid provided for $line[0] contains a not number character.\n      This information will be discarded.\n";
+		$error2 = 1;
+	}
+	$hash_eldo{"taxonomy"}{"code"}{$line[0]} = $line[1] if ($error2 == 0);
+	$hash_eldo{"taxonomy"}{"txids"}{$line[1]} = {} if ($error2 == 0);
+	$map_txid{"txids"}{$line[1]} = {};
+}
+close TABLE;
+
+# Connect and Prepare Database
+my %mysqlInfo;
+my $wire;
+if ($localMySQL){
+	if ($mysqlInfo{"host"} && $mysqlInfo{"user"} && $mysqlInfo{"password"} && $mysqlInfo{"database"}){
+		$wire = Net::Wire10->new(
+			host     => $mysqlInfo{"host"},
+			user     => $mysqlInfo{"user"},
+			port     => $mysqlInfo{"port"},
+			password => $mysqlInfo{"password"},
+			database => $mysqlInfo{"database"}
+		);
+		eval {$wire->connect;};
+		if ($@) {
+			die "\nERROR: Could not connect to mysql database. Please check mysql parameters in CONFIG.xml\n";
+		} else {
+			print "Connected to mysql database.\n";
+			$mysqlInfo{"connection"} = 1;
+		}
+	} 
+}
+	
+# check internet connection
+
+my $internetConnection = 1;
+my $url_test = "http://www.msftncsi.com/ncsi.txt";
+my $response_test = HTTP::Tiny->new->get($url_test);
+
+if ($response_test->{content} !~ m/Microsoft NCSI/){
+	$internetConnection = 0;
+}
+
+if (!$mysqlInfo{"connection"} and $internetConnection == 0){
+	die "\nERROR: an internet connection is required.\n";
+}
+
+# retrieve lineage information
+&pair2pairLCA(keys %{$map_txid{"txids"}});
+
+foreach my $txid(keys %{$map_txid{"txids"}}){
+	my $taxsimpleLin = $map_txid{"txids"}{$txid}{"lineageTaxSimple"};
+	$hash_eldo{"taxonomy"}{"txid"}{$txid}{"taxSimpleLineage"} = $taxsimpleLin;
+}
+
+# read all trees in the directory
+
+if ($treeDirectory =~ /\/$/){
+	chop $treeDirectory;
+}
+my $listFileDistance = `find $treeDirectory/`;
+my %fileList;
+
+my @listFile = split(/\n/, $listFileDistance);
+foreach my $line(@listFile){
+	next if ($line eq "");
+	my $filetmp = $line;
+	$filetmp = substr($filetmp, rindex($filetmp, "/") + 1);
+	#$filetmp = substr($filetmp, 0, index($filetmp, "_"));
+	$fileList{$filetmp} = $line;
+}
+
+my %generalResult;
+
+my $pm = Parallel::ForkManager->new($numThreads, '/tmp/');
+
+$pm -> run_on_finish ( # called BEFORE the first call to start()
+	sub {
+		my ($pid, $exit_code, $ident, $exit_signal, $core_dump, $data_structure_reference) = @_;
+		if ($data_structure_reference){
+			my %hash_def = %{$data_structure_reference};
+			my $file = $hash_def{"file"};
+			#my $file = $$fileRef;
+			my $leafRef = $hash_def{"leaf"};
+			my @leaf = @$leafRef;
+			my $matrixRef = $hash_def{"matrix"};
+			my @matrix = @$matrixRef;
+			my $taxRef = $hash_def{"taxonomy"};
+			my %tax = %$taxRef;
+			$generalResult{$file}{"leaf"} = \@leaf;			
+			$generalResult{$file}{"matrix"} = \@matrix;			
+			$generalResult{$file}{"taxonomy"} = \%tax;
+		}
+	}
+);
+
+# for each tree:
+foreach my $file (sort keys %fileList){
+
+	print $file."\n";
+	my $treeFile2 = $fileList{$file};
+	my $input = new Bio::TreeIO(-file   => $treeFile2,
+								-format => "newick");
+	my $tree = $input -> next_tree;
+	next if (!$tree);
+	$pm->start() and next;
+	# extract leaf node	
+	my @leaves2 = $tree -> get_leaf_nodes();
+	my @nodes2analyse;
+	my %leavesMap;
+	my %leafTaxonomy;
+	my $count = 0;
+	my %hash_tree;
+	my %hash_leaves;
+	my @genus;
+	my @pairTable;
+	foreach my $leaf (@leaves2){
+		my $genus = $leaf -> id;		
+		push(@genus, $genus);
+		if (exists $leavesMap{$genus}){
+			#duplicated leaves - attribute a new id
+			my $count2 = 2;
+			while (exists $leavesMap{$genus."_dup".$count}){
+				$count2++;
+			}
+			$genus = $genus."_dup".$count;
+			$leaf -> id($genus);
+		}
+		$leavesMap{$genus} = $count;
+		$count++;
+		
+		# identify taxonomy
+		if ($delimiter && $position =~ (/^\d+$/)){
+			my $delimiter2 = quotemeta($delimiter);
+			my @tags = split(/$delimiter2/, $genus);
+			my $leafTxid = $tags[$position];
+			if (!exists $hash_eldo{"taxonomy"}{"code"}{$leafTxid}){
+				die "ERROR: Problem with leaf $genus during taxonomy extraction.\n       Code extracted: $leafTxid.\n";
+			} else {
+				$leafTaxonomy{"txid"}{$hash_eldo{"taxonomy"}{"code"}{$leafTxid}}{$leafTxid} = 1;
+				$leafTaxonomy{"code"}{$genus}{"txid"} = $hash_eldo{"taxonomy"}{"code"}{$leafTxid};
+			}
+		} else {
+			my $genus2 = $genus;
+			$genus2 =~ s/_dup\d+$//;
+			if (!exists $hash_eldo{"taxonomy"}{"code"}{$genus2}){
+				die "ERROR: Problem with leaf $genus during taxonomy extraction.\n       Code extracted: $genus.\n";
+			} else {
+				$leafTaxonomy{"txid"}{$hash_eldo{"taxonomy"}{"code"}{$genus}}{$genus2} = 1;
+				$leafTaxonomy{"code"}{$genus2}{"txid"} = $hash_eldo{"taxonomy"}{"code"}{$genus};
+			}
+		}
+		$leafTaxonomy{"code"}{$genus}{"pos"} = $leavesMap{$genus};
+		
+		my $ancestor = $leaf -> ancestor;
+		$hash_tree{$ancestor}{"descendent"} += 1;
+		my @descendent = $ancestor -> each_Descendent;
+		my $length = $tree->distance(-nodes=>[$leaf, $ancestor]);
+		my @length = ($length);
+		$hash_leaves{$genus} = \@length;
+		if ($hash_tree{$ancestor}{"descendent"} > 1){
+			foreach my $leaf2(keys %{$hash_tree{$ancestor}{"leaf"}}){
+				my @leaf2Length = @{$hash_leaves{$leaf2}};
+				my $sumLength =	$leaf2Length[0] + $length;
+				my @codeSet;
+				push(@codeSet,$leavesMap{$leaf2});
+				push(@codeSet,$leavesMap{$genus});
+				@codeSet = sort { $a <=> $b } @codeSet;
+				$pairTable[$codeSet[0]][$codeSet[1]] = $sumLength;
+			}
+		}
+		$hash_tree{$ancestor}{"leaf"}{$genus} = 1;
+		if (scalar @descendent == $hash_tree{$ancestor}{"descendent"}){
+			push(@nodes2analyse, $ancestor);
+		}
+	}
+	
+	my $rootNode = $tree->get_root_node();
+	
+	while (scalar @nodes2analyse > 0){
+		my $node = shift @nodes2analyse;
+		next if ($node eq $rootNode);
+		my $ancestor = $node -> ancestor;
+		$hash_tree{$ancestor}{"descendent"} += 1;
+		my @descendent = $ancestor -> each_Descendent;
+		my $length = $tree->distance(-nodes=>[$node, $ancestor]);
+		my @currentLeaves;
+		if($hash_tree{$ancestor}{"descendent"} > 1){
+			@currentLeaves = keys %{$hash_tree{$ancestor}{"leaf"}};
+		}
+		foreach my $leaf(keys %{$hash_tree{$node}{"leaf"}}){
+			#print $leaf."\n";
+			$hash_tree{$ancestor}{"leaf"}{$leaf} = $hash_tree{$node}{"leaf"}{$leaf} + 1;
+			my @length = @{$hash_leaves{$leaf}};
+			my $lastLengthId = scalar @length - 1;
+			my $currentNodeLength = $length[$lastLengthId] + $length;
+			push(@length, $currentNodeLength);
+			$hash_leaves{$leaf} = \@length;
+			
+			if ($hash_tree{$ancestor}{"descendent"} > 1){
+				foreach my $leaf2(@currentLeaves){
+					my @leaf2Length = @{$hash_leaves{$leaf2}};
+					my $sumLength =	$leaf2Length[$hash_tree{$ancestor}{"leaf"}{$leaf2}-1] + $length[$lastLengthId + 1];
+					my @codeSet;
+					push(@codeSet,$leavesMap{$leaf2});
+					push(@codeSet,$leavesMap{$leaf});
+					@codeSet = sort { $a <=> $b } @codeSet;
+					$pairTable[$codeSet[0]][$codeSet[1]] = $sumLength;
+				}
+			}
+		}
+		if (scalar @descendent == $hash_tree{$ancestor}{"descendent"}){
+			push(@nodes2analyse, $ancestor);
+		}
+	}
+	
+	#$generalResult{$file}{"leaf"} = \@genus;			
+	#$generalResult{$file}{"matrix"} = \@pairTable;			
+	#$generalResult{$file}{"taxonomy"} = \%leafTaxonomy;	
+	my %forkResult = (
+		"file" => $file,
+		"leaf" => \@genus,
+		"matrix" => \@pairTable,
+		"taxonomy" => \%leafTaxonomy,
+	);
+	$pm->finish(0, \%forkResult);
+}
+
+$pm->wait_all_children;
+	
+# store distance
+
+$hash_eldo{"distance"} = {%generalResult};
+store \%hash_eldo, $outfile;
+print "All Done!\n\n";
+
+######### SUBROUTINES #########
+
+sub pair2pairLCA {
+	
+	# Retrive lineage of each txid and determine the LCA in each pair of txid.
+	# input: an array containing txid.
+	# return: a hash having txid as key, with information about the name, lineage, lca and lcaN of each txid.
+	print "Determining LCA...\n";
+	my @txid_list = @_;
+	my @txidRetrieve = @txid_list;
+	my %map_info;
+	my $n = -1;
+	my $m = -50;
+	my $fetch_lineage;
+	my @taxSimple_ranks = (
+		"superkingdom",
+		"kingdom",
+		"phylum",
+		"subphylum",
+		"superclass",
+		"class",
+		"subclass",
+		"superorder",
+		"order",
+		"suborder",
+		"superfamily",
+		"family",
+		"subfamily",
+		"genus",
+		"subgenus",
+		"species",
+		"subspecies"
+	);
+	# from http://bioportal.bioontology.org/ontologies/TAXRANK
+	my %ncbi_all_ranks = ( 
+		"superkingdom" => 0,
+		"kingdom" => 1,
+		"subkingdom" => 2,
+		"superphylum" => 3,
+		"phylum" => 4,
+		"subphylum" => 5,
+		"superclass" => 6,
+		"class" => 7,
+		"subclass" => 8,
+		"infraclass" => 9,
+		"superorder" => 10,
+		"order" => 11,
+		"suborder" => 12,
+		"infraorder" => 13,
+		"parvorder" => 14,
+		"superfamily" => 15,
+		"family" => 16,
+		"subfamily" => 17,
+		"tribe" => 18,
+		"subtribe" => 19,
+		"genus" => 20,
+		"subgenus" => 21,
+		"species group" => 22,
+		"species subgroup" => 23,
+		"species" => 24,
+		"subspecies" => 25,
+		"varietas" => 26,
+		"forma" => 27,
+		"no ranks" => -1
+	);
+	my %taxSimple_ranks = (
+		"superkingdom" 	=> "spk_of_",
+		"kingdom"		=> "kin_of_",
+		"phylum" 		=> "phy_of_",
+		"subphylum" 	=> "sbp_of_",
+		"superclass" 	=> "spc_of_",
+		"class" 		=> "cla_of_",
+		"subclass" 		=> "sbc_of_",
+		"superorder" 	=> "spo_of_",
+		"order" 		=> "ord_of_",
+		"suborder" 		=> "sbo_of_",
+		"superfamily" 	=> "spf_of_",
+		"family" 		=> "fam_of_",
+		"subfamily" 	=> "sbf_of_",
+		"genus" 		=> "gen_of_",
+		"subgenus" 		=> "sbg_of_",
+		"species" 		=> "spe_of_",
+		"subspecies" 	=> "sbs_of_"
+	);
+
+	if ($mysqlInfo{"connection"}){
+		print "  Retrieving taxonomy info from local database...";
+		my %rev_ncbi_all_ranks = ( 
+			-1 => "no rank",
+			0 => "superkingdom",
+			1 => "kingdom",
+			2 => "subkingdom",
+			3 => "superphylum",
+			4 => "phylum",
+			5 => "subphylum",
+			6 => "superclass",
+			7 => "class",
+			8 => "subclass",
+			9 => "infraclass",
+			10 => "superorder",
+			11 => "order",
+			12 => "suborder",
+			13 => "infraorder",
+			14 => "parvorder",
+			15 => "superfamily",
+			16 => "family",
+			17 => "subfamily",
+			18 => "tribe",
+			19 => "subtribe",
+			20 => "genus",
+			21 => "subgenus",
+			22 => "species group",
+			23 => "species subgroup",
+			24 => "species",
+			25 => "subspecies",
+			26 => "varietas",
+			27 => "forma"
+		);
+
+		my %missingTax = map { $_ => 1 } @txidRetrieve;
+		my $results = $wire->query("SELECT * FROM taxonomy where txid in ('".join("','", @txidRetrieve)."');");
+		while (my $row = $results->next_hash) {
+			my $txid = $row->{txid};
+			my $lineage = $row->{lineage};
+			my @lineage_all = split(";", $lineage);
+			my @lineage;
+			my @ranks;
+			foreach my $level(@lineage_all){
+				my ($name, $rank) = split(/:([^:]+)$/, $level);
+				$name =~ s/,//g;
+				$rank = $rev_ncbi_all_ranks{$rank};
+				push (@lineage, $name);
+				push (@ranks, $rank);
+			}
+			
+			$map_txid{"txids"}{$txid}{"rank"} = \@ranks;
+			$map_txid{"txids"}{$txid}{"lineage"} = \@lineage;
+			$map_txid{"txids"}{$txid}{"name"} = $lineage[$#lineage];
+			delete $missingTax{$txid};
+		}
+		if (scalar keys %missingTax > 0){
+			print "\n  Some txids  (".scalar (keys %missingTax).") was not encountered in local database.\n  Retrieving from the web.";
+		} else {
+			print "  OK!\n";
+		}
+		@txidRetrieve = keys %missingTax;
+	}
+	
+	
+	if ($#txidRetrieve > 0){
+		if ($internetConnection == 1){
+			print "  Retrieving taxonomy info from web...";
+			do {
+				
+				$n = $n + 50;
+				$m = $m + 50;
+				$n = $#txidRetrieve if ($n > $#txidRetrieve);
+				my $url_fetch_lineage = "http://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi?db=taxonomy&id=".join(",",@txidRetrieve[$m .. $n]);
+				my $fetch_lineage;
+				my $errorCount = -1;
+				do {
+					my $response = HTTP::Tiny->new->get($url_fetch_lineage);
+					$fetch_lineage = $response->{content};
+					$errorCount++;
+					sleep 1;
+				} while ($fetch_lineage =~ m/<\/Error>|<title>Bad Gateway!<\/title>|<title>Service unavailable!<\/title>|Error occurred:/ and $errorCount < 5);
+				if ($errorCount > 4){
+					die "\nERROR: Sorry, access to NCBI server retrieved error 4 times. Please, try to run TaxOnTree again later.";
+				}
+			
+				my $xs2 = XML::Simple->new();
+				my $doc_lineage = $xs2->XMLin($fetch_lineage);
+				
+				my @taxaSet = ();
+				
+				if (ref $doc_lineage->{"Taxon"} eq 'ARRAY') {
+					@taxaSet = @{$doc_lineage->{"Taxon"}};
+				} else {
+					push (@taxaSet, $doc_lineage->{"Taxon"});
+				}
+
+				foreach my $taxa(@taxaSet){
+					my $txid;
+					if (exists $taxa->{"AkaTaxIds"}){
+						if (ref $taxa->{"AkaTaxIds"} eq 'ARRAY'){
+							die "\nERROR: Problems with obsolete taxonomy ID, please report me this bug (tetsufmbio\@gmail.com).\n";
+						} else {
+							$txid = $taxa->{"AkaTaxIds"}->{"TaxId"};
+						}
+					} else {
+						$txid = $taxa->{"TaxId"};
+					}
+					my $lineage = $taxa->{"Lineage"};
+					my @lineageEx;
+					$map_txid{"txids"}{$txid}{"name"} = $taxa->{"ScientificName"};			
+					# modified in v.1.6
+					if (exists ($taxa->{"LineageEx"})){
+						my $lineage = $taxa->{"Lineage"};
+						$lineage =~ s/,//g;
+						my @lineage = split("; ",$lineage);
+						push (@lineage, $taxa->{"ScientificName"});
+						unshift (@lineage, "Root");
+						$map_txid{"txids"}{$txid}{"lineage"} = \@lineage;
+						if (ref $taxa->{"LineageEx"}->{"Taxon"} eq 'ARRAY'){
+							@lineageEx = @{$taxa->{"LineageEx"}->{"Taxon"}};
+							my @ranks;
+							foreach my $lineageEx (@lineageEx){
+								my %singleLineageEx = %$lineageEx;
+								push (@ranks, $singleLineageEx{"Rank"});
+							}
+							unshift (@ranks, "Root");
+							push (@ranks, $taxa->{"Rank"});
+							$map_txid{"txids"}{$txid}{"rank"} = \@ranks;
+						} elsif (ref $taxa->{"LineageEx"}->{"Taxon"} eq 'HASH') {
+							my @ranks;
+							push (@ranks, $taxa->{"LineageEx"}->{"Taxon"}->{"Rank"});
+							unshift (@ranks, "Root");
+							push (@ranks, $taxa->{"Rank"});
+							$map_txid{"txids"}{$txid}{"rank"} = \@ranks;
+						} else {
+							die "\nERROR: problems with this taxa:".$txid.". Please report me (tetsufmbio\@gmail.com)\n";
+						}
+					} else {
+						my @ranks;
+						my @lineage;
+						if ($txid == 1){
+							# root
+							unshift (@ranks, "Root");
+							push (@lineage, "Root");
+						} else {
+							# cellular organism
+							unshift (@ranks, "Root");
+							push (@ranks, $taxa->{"Rank"});
+							push (@lineage, $taxa->{"ScientificName"});
+							unshift (@lineage, "Root");					
+						}
+						$map_txid{"txids"}{$txid}{"rank"} = \@ranks;
+						$map_txid{"txids"}{$txid}{"lineage"} = \@lineage;
+					}
+				}
+			} while ($n < $#txidRetrieve);
+			print "  OK!\n";
+		} else {
+			print "\nNOTE: no internet connection. Txid with missing info will be discarded from the analysis.\n";
+		}
+	}
+	# verify if all txid information was retrieved
+	
+	foreach my $txid (@txid_list){
+		if (!(exists $map_txid{"txids"}{$txid}{"rank"})){
+			print "\nNOTE: Could not retrieve info from txid: $txid.\n";
+			delete $map_txid{"txids"}{$txid};
+			$missingTxid{$txid} = 1;
+		}
+	}
+	@txid_list = keys %{$map_txid{"txids"}};
+	
+	# taxSimple
+	foreach my $txid(keys %{$map_txid{"txids"}}){
+		
+		my @lineageEx = @{$map_txid{"txids"}{$txid}{"lineage"}};
+		my @rankEx = @{$map_txid{"txids"}{$txid}{"rank"}};
+		
+		my %lineageEx = ();
+		my %lineageExRank = ();
+		my $n = 0;
+		foreach my $lineageEx (@lineageEx){
+
+			$lineageEx{$n}{"rank"} = $rankEx[$n];
+			$lineageEx{$n}{"name"} = $lineageEx[$n];
+			$lineageExRank{$rankEx[$n]} = $n;
+			$n++;
+		}
+				
+		my $m = 0;
+		my @lineageTaxSimple;
+		for (my $i = 0; $i < scalar @taxSimple_ranks; $i++){
+			if (exists $lineageExRank{$taxSimple_ranks[$i]}){
+			
+				$m = $lineageExRank{$taxSimple_ranks[$i]};
+				push (@lineageTaxSimple, $lineageEx{$m}{"name"});
+				
+			} else {
+				my $l = $m;
+				while (exists($lineageEx{$l + 1}{"rank"}) and !(exists $taxSimple_ranks{$lineageEx{$l + 1}{"rank"}})){
+					if ($lineageEx{$l + 1}{"rank"} ne "no rank"){
+						# verify if the searching rank level is below the current rank level
+						if ($ncbi_all_ranks{$taxSimple_ranks[$i]} < $ncbi_all_ranks{$lineageEx{$l + 1}{"rank"}}){
+							last;
+						} else {
+							$l++;
+						}
+					} else {
+						$l++;
+					}
+				}
+				push (@lineageTaxSimple, $taxSimple_ranks{$taxSimple_ranks[$i]}.$lineageEx{$l}{"name"});
+				$m = $l;
+			}
+		}
+		unshift (@lineageTaxSimple, "Root");
+		$map_txid{"txids"}{$txid}{"lineageTaxSimple"} = \@lineageTaxSimple;
+		my @ranksTaxSimple = @taxSimple_ranks;
+		unshift (@ranksTaxSimple, "Root");
+		$map_txid{"txids"}{$txid}{"rankTaxSimple"} = \@ranksTaxSimple;
+	}
+	
+	return 1;
+}
+
+
+=head1 NAME
+
+ELDOgraph - External Least Divergent Ortholog graph
+
+=head1 SYNOPSIS
+
+./eldograph -treedir <tree_directory> -taxtable <table_file>
+
+=item B<Other parameters>:
+
+[-out file_name] [-position] [-delimiter] [-numThreads]
+		
+=item B<Help>:
+
+[-help] [-man] [-version]
+
+Use -man for a detailed help.
+
+=head1 OPTIONS
+
+=over 8
+
+=item B<-treedir> <tree_directory>
+
+A path for a folder with the gene trees.
+
+=item B<-taxtable> <table_name>
+
+A table containing the taxonomic names comprising all gene trees in the first column and the correspondent taxonomy
+ID in the second. If the leaf names do not correspond exactly with the taxonomic name, see the parameters -delimiter 
+and -position.
+
+Example: If "gorilla", "human" and "chimp" correspond to all taxonomic names encountered in the gene tree set, 
+provide a tab-delimited table like this:
+
+											human	9606
+											chimp	9598
+											gorilla	9595
+
+=item B<-out> <file_name> Default: "eldo_db.hash"
+
+Output file name.
+
+=item B<-numThreads> Defalut: 1
+
+Number of processors to be used for programs that can handle multi-threading.
+
+=item B<-delimiter>
+
+A character delimiter. You can provide the character delimiter and the field position 
+if the taxonomic names provided in the table are delimited in the leaves of the gene 
+trees. Use this option along with -position.
+E.g. for leaf names with the following pattern: Phy000CXRS_YEAST, by choosing "_" as 
+delimiter and "1" as field position (0 is the first position), YEAST will be extracted 
+to be consulted in the taxonomic table.
+
+=item B<-position> Defalut: 1
+
+Field position. Use this option along with -delimiter. See -delimiter.
+
+=item B<-version>
+
+Print ELDOgraph version.
+
+=item B<-help>
+
+Print a brief help message and exits.
+
+=item B<-man>
+
+Prints the manual page and exits.
+
+=back
+
+=head1 DESCRIPTION
+
+B<ELDOgraph> is a tool for comparative genomics analysis that assesses the species relationship considering the phylogenetic distance provided by several gene trees. 
+
+=cut

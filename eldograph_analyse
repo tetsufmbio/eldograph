@@ -1,0 +1,775 @@
+#!/usr/bin/perl -w
+
+use strict;
+use FindBin qw($Bin);
+use lib "$Bin/lib/perl5";
+use Data::Dumper;
+use Storable;
+use Getopt::Long;
+use Pod::Usage;
+
+# inputs
+
+$| = (@ARGV > 0); 
+
+# setup my defaults
+
+my $version;
+my $eldoVersion = "ELDOgraph 1.0";
+my $hashFile;
+my $rank;
+my $threshold = 0;
+my $help;
+my $man;
+my $outfile = "eldo_result";
+
+GetOptions(
+    'hashFile=s'=> \$hashFile,
+    'rank=s'    => \$rank,
+    'out=s'    => \$outfile,
+    'help!'     	=> \$help,
+	'version!'		=> \$version,
+	'man!'			=> \$man,
+	'threshold=f'		=> \$threshold,
+
+) or pod2usage(-verbose => 99, 
+            -sections => [ qw(NAME SYNOPSIS) ] );
+
+pod2usage(0) if $man;
+pod2usage(2) if $help;
+
+if ($version){
+	print $eldoVersion."\n";
+	exit;
+}
+
+if (!$hashFile){
+	print "ERROR: -hashfile not provided.\n";
+	pod2usage(2);
+}
+if (!$rank){
+	print "ERROR: -rank not provided.\n";
+	pod2usage(2);
+}
+
+####################
+
+my %hashFile = %{retrieve $hashFile} or die;
+
+# all taxonomy information
+# hash_eldo{"taxonomy"}{"txid"}{$txid}{"taxSimpleLineage"} = $lineage
+# hash_eldo{"taxonomy"}{"code"}{$code} = $txid
+
+# hash_eldo{"distance"}{$file}{"taxonomy"}{"txid"}{$txid} = @listID --> list of leafid of $txid in the tree file
+# hash_eldo{"distance"}{$file}{"taxonomy"}{"code"}{$leafid} = $txid --> txid of each leafid in the tree file
+# hash_eldo{"distance"}{$file}{"leaf"} = @listID --> list of leaf ordered according to the distance matrix
+# hash_eldo{"distance"}{$file}{"matrix"} = @listID --> distance matrix ordered according to the list in "leaf"
+
+my %hashResult;
+my @taxSimple_ranks2 = (
+	"root",
+	"superkingdom",
+	"kingdom",
+	"phylum",
+	"subphylum",
+	"superclass",
+	"class",
+	"subclass",
+	"superorder",
+	"order",
+	"suborder",
+	"superfamily",
+	"family",
+	"subfamily",
+	"genus",
+	"subgenus",
+	"species",
+	"subspecies"
+);
+
+my %taxSimple_ranks2 = (
+	"root" => 0,
+	"superkingdom" => 1,
+	"kingdom" => 2,
+	"phylum" => 3,
+	"subphylum" => 4,
+	"superclass" => 5,
+	"class" => 6,
+	"subclass" => 7,
+	"superorder" => 8,
+	"order" => 9,
+	"suborder" => 10,
+	"superfamily" => 11,
+	"family" => 12,
+	"subfamily" => 13,
+	"genus" => 14,
+	"subgenus" => 15,
+	"species" => 16,
+	"subspecies" => 17
+);
+
+if ($rank =~ /\D/){
+	if (!exists $taxSimple_ranks2{$rank}){
+		die "ERROR: invalid rank ($rank) provided.\nRank should be a number between 1 to 17 or a taxonomic rank. see -man for details.";
+	} else {
+		$rank = $taxSimple_ranks2{$rank};
+	}
+} else {
+	if ($rank > 17 || $rank < 1){
+		die "ERROR: invalid rank ($rank) provided.\nRank should be a number between 1 to 17 or a taxonomic rank. see -man for details.";
+	}
+}
+
+my %hashRank;
+my %hashCount;
+my %hashCountB;
+foreach my $file (keys %{$hashFile{"distance"}}){
+	next if ($file eq "");
+	my @distances = @{$hashFile{"distance"}{$file}{"matrix"}};
+	my @genera = @{$hashFile{"distance"}{$file}{"leaf"}};
+	
+	my %hashCount2;
+	my $k = $rank;
+	#for(my $k = 7; $k < 15; $k++){
+		for(my $i = 0; $i < scalar @genera; $i++){
+			my $txid1 = $hashFile{"distance"}{$file}{"taxonomy"}{"code"}{$genera[$i]}{"txid"};
+			my @lineage1 = @{$hashFile{"taxonomy"}{"txid"}{$txid1}{"taxSimpleLineage"}};
+			my $minDistance = -1;
+			my @minGenus;
+			for(my $j = 0; $j < scalar @genera; $j++){
+				next if ($i == $j);
+				my $first = $i;
+				my $second = $j;
+				if ($i > $j){
+					$first = $j;
+					$second = $i;
+				}
+				my $txid2 = $hashFile{"distance"}{$file}{"taxonomy"}{"code"}{$genera[$j]}{"txid"};
+				my @lineage2 = @{$hashFile{"taxonomy"}{"txid"}{$txid2}{"taxSimpleLineage"}};
+				next if ($lineage1[$k] eq $lineage2[$k]);
+				if (!exists $hashCount2{$genera[$i]}{$lineage2[$k]}){
+					$hashCount{$genera[$i]}{$lineage2[$k]} += 1;
+					$hashCount2{$genera[$i]}{$lineage2[$k]} = 1;
+				}
+				
+				if ($minDistance < 0){
+					$minDistance = $distances[$first][$second];
+					#push (@minGenus, $genera[$j]);
+				} else {
+					if ($minDistance > $distances[$first][$second]){
+						$minDistance = $distances[$first][$second];
+						#undef @minGenus;
+						#push (@minGenus, $genera[$j]);
+					} 
+				}
+				if (!defined $minDistance){
+					print $file."\n";
+					print $first." ".$second." ".$distances[$first][$second]."\n";
+					print $first." ".$second." ".$distances[$second][$first]."\n";
+					print Dumper($distances[$first]);
+					exit;
+				}
+			}
+			my $cutoff = $minDistance*(1+$threshold);
+			for(my $j = 0; $j < scalar @genera; $j++){
+				next if ($i == $j);
+				my $first = $i;
+				my $second = $j;
+				if ($i > $j){
+					$first = $j;
+					$second = $i;
+				} 
+				if ($distances[$first][$second] <= $cutoff){
+					my $txid2 = $hashFile{"distance"}{$file}{"taxonomy"}{"code"}{$genera[$j]}{"txid"};
+					my @lineage2 = @{$hashFile{"taxonomy"}{"txid"}{$txid2}{"taxSimpleLineage"}};
+					next if ($lineage1[$k] eq $lineage2[$k]);
+					push (@minGenus, $genera[$j])
+				}
+			}		
+			
+			#print $minGenus."\n";
+			next if (scalar @minGenus == 0);
+			$hashCountB{$taxSimple_ranks2[$k]}{$genera[$i]} += 1;
+			my %hashCount3;
+			for (my $m = 0; $m < scalar @minGenus; $m++){
+				my $txidMinGenus = $hashFile{"distance"}{$file}{"taxonomy"}{"code"}{$minGenus[$m]}{"txid"};
+				my @lineageMinGenus = @{$hashFile{"taxonomy"}{"txid"}{$txidMinGenus}{"taxSimpleLineage"}};
+				my $txidDef = $lineageMinGenus[$k];
+				$hashCount3{$txidDef} = 1;
+				$hashRank{$taxSimple_ranks2[$k]}{$txidDef}{$minGenus[$m]} = 1;
+				#if ($genera[$i] eq "Homo" and $minGenus[$m] eq "Equus"){
+				#	print $file."\n";
+				#}
+			}
+			foreach my $keys(keys %hashCount3){
+				$hashResult{$taxSimple_ranks2[$k]}{$genera[$i]}{$keys} += 1;#/(scalar keys %hashCount3);
+			}
+		}
+		
+	
+	#}
+}
+
+# print result
+open(HTML, "> ".$outfile.".html") or die;
+open(TAB, "> ".$outfile.".tab") or die;
+open(TAB2, "> ".$outfile."_matrix.tab") or die;
+
+print HTML '
+<!DOCTYPE html>
+<meta charset="utf-8">
+<script type="text/javascript" src="http://d3js.org/d3.v3.min.js"></script>
+<script src="http://ajax.googleapis.com/ajax/libs/jquery/1.12.2/jquery.min.js"></script>
+<style>
+
+path.link {
+  fill: none;
+  stroke: #666;
+  stroke-width: 1.5px;
+}
+
+path.link.twofive {
+  opacity: 0.25;
+}
+
+path.link.fivezero {
+  stroke: #3366ff;
+}
+
+path.link.sevenfive {
+  stroke: #00cc00;
+}
+
+path.link.onezerozero {
+  stroke: #ff0000;
+}
+
+circle {
+  fill: #ccc;
+  stroke: #fff;
+  stroke-width: 1.5px;
+}
+
+text {
+  fill: #000;
+  font: 10px sans-serif;
+  pointer-events: none;
+}
+
+div.param {
+	float:left;
+	margin:10px;
+	padding:10px;
+	background:#E6E6E6;
+}
+
+div#graph {
+	margin: 10px;
+	border; gray;
+	border-style: solid;
+	display: inline-block;
+}
+</style>
+<body>
+<h1>ELDO analysis</h1>
+<form>
+	<div class="param">
+		<span>Threshold:</span>
+		<input id="thresholdValueIn" type="range" min="0" max="100" name="threshold" value="10" oninput="thresholdValueOut.value = thresholdValueIn.value/100;">
+		<output id="thresholdValueOut">0.1</output>
+	</div>
+	<div class="param">
+		<span>Link distance:</span>
+		<input id="linkValueIn" type="range" min="50" max="1000" name="link" value="100" oninput="linkValueOut.value = linkValueIn.value;">
+		<output id="linkValueOut">100</output>
+	</div>
+	<div class="param">
+		<span>Charge:</span>
+		<input id="chargeValueIn" type="range" min="50" max="1000" name="charge" value="350" oninput="chargeValueOut.value = chargeValueIn.value*(-1);">
+		<output id="chargeValueOut">-350</output>
+	</div>
+	<div class="param" style="background:#FFF">
+		<button type="button" id="myBtn" onclick="download()">Download</button>
+	</div>
+</form>
+<div id="graph"></div>
+<script>
+
+// get the data
+links = [';
+
+#for(my $l = 7; $l < 15; $l++){
+my $l = $rank;
+	#print "# rank: ".$taxSimple_ranks2[$l]."\n";
+	#print "genus\t".join("\t", sort keys %{$hashRank{$taxSimple_ranks2[$l]}})."\ttotal\n";
+	foreach my $tax(sort keys %{$hashRank{$taxSimple_ranks2[$l]}}){
+		print TAB2 $tax;
+		foreach my $subject (sort keys %{$hashRank{$taxSimple_ranks2[$l]}}){
+			if ($tax eq $subject){
+				print TAB2 "\t-";
+				next;
+			};
+			print HTML "	{source:\"".$subject."\",target:\"".$tax."\",value:";
+			print TAB $subject."\t".$tax."\t";
+			my $count = 0;
+			my $sum = 0;
+			foreach my $tax2(keys %{$hashRank{$taxSimple_ranks2[$l]}{$tax}}){
+				if (exists $hashResult{$taxSimple_ranks2[$l]}{$tax2}{$subject}){
+					$sum += $hashResult{$taxSimple_ranks2[$l]}{$tax2}{$subject}/$hashCountB{$taxSimple_ranks2[$l]}{$tax2};
+					
+				}
+				$count += 1;
+			}
+			
+			if ($count == 0){
+				print HTML "0},\n";
+				print TAB "0\n";
+				print TAB2 "\t0";
+			} else {
+				print HTML $sum/$count."},\n";
+				print TAB $sum/$count."\n";
+				print TAB2 "\t".$sum/$count;
+			}
+		}
+		print TAB2 "\n";
+	}
+	print HTML "];\n";
+	print HTML '
+var threshold = 0.1;
+var linkDistanceValue = 100;
+var chargeValue = -350;
+var focus_node = null, highlight_node = null;
+var highlight_color = "blue";
+var highlight_trans = 0.1;
+var text_center = false;
+var outline = false;
+var default_node_color = "#ccc";
+var nominal_stroke = 1.5;
+var nominal_text_size = 10;
+draw();
+
+function draw(){
+
+	var nodes = {};
+	var tempLinks =[];
+	var linkedByIndex = {};
+	// Compute the distinct nodes from the links.
+	links.forEach(function(link) {
+		if (link.value >= threshold){
+			var cloneLink = $.extend(true, {}, link);
+			tempLinks.push(cloneLink);
+			linkedByIndex[link.source + "," + link.target] = true;
+		}
+	});
+	tempLinks.forEach(function(link) {
+		link.source = nodes[link.source] || 
+			(nodes[link.source] = {name: link.source});
+		link.target = nodes[link.target] || 
+			(nodes[link.target] = {name: link.target});
+		link.value = +link.value;
+	});
+	function isConnected(a, b) {
+        return linkedByIndex[b.name + "," + a.name]|| a.name == b.name;// || linkedByIndex[a.name + "," + b.name];
+    }
+
+	function hasConnections(a) {
+		for (var property in linkedByIndex) {
+				s = property.split(",");
+				if ((s[0] == a.name || s[1] == a.name) && linkedByIndex[property])
+				return true;
+		}
+	return false;
+	}
+	
+	var width = 1200,
+		height= 800;
+
+	var force = d3.layout.force()
+		.nodes(d3.values(nodes))
+		.links(tempLinks)
+		.size([width, height])
+		.linkDistance(linkDistanceValue)
+		.charge(chargeValue)
+		.on("tick", tick)
+		.start();
+
+	// Set the range
+	var  v = d3.scale.linear().range([0, 100]);
+	
+	// Scale the range of the data
+	v.domain([d3.min(tempLinks, function(d) { return d.value; }), d3.max(tempLinks, function(d) { return d.value; })]);
+	// asign a type per value to encode opacity
+	tempLinks.forEach(function(link) {
+		if (v(link.value) <= 25) {
+			link.type = "twofive";
+		} else if (v(link.value) <= 50 && v(link.value) > 25) {
+			link.type = "fivezero";
+		} else if (v(link.value) <= 75 && v(link.value) > 50) {
+			link.type = "sevenfive";
+		} else if (v(link.value) <= 100 && v(link.value) > 75) {
+			link.type = "onezerozero";
+		}
+	});
+	
+	var css = {
+		twofive:"#bcbcbc",
+		fivezero:"#3366ff",
+		sevenfive:"#00cc00",
+		onezerozero:"#ff0000",
+	};
+	
+	var svg = d3.select("div#graph").append("svg")
+		.attr("width", width)
+		.attr("height", height)
+		.attr("id", "graphResult");
+
+	// build the arrow.
+	svg.append("svg:defs").selectAll("marker")
+		.data(["end"])      // Different link/path types can be defined here
+	  .enter().append("svg:marker")    // This section adds in the arrows
+		.attr("id", String)
+		.attr("viewBox", "0 -5 10 10")
+		.attr("refX", 15)
+		.attr("refY", -1.5)
+		.attr("markerWidth", 6)
+		.attr("markerHeight", 6)
+		.attr("orient", "auto")
+	  .append("svg:path")
+		.attr("d", "M0,-5L10,0L0,5");
+
+	// add the links and the arrows
+	var path = svg.append("svg:g").selectAll("path")
+		.data(force.links())
+	  .enter().append("svg:path")
+		//.attr("style", function(d) { return "fill:none;stroke-width:1.5px;" + css[d.type]; })
+		.attr("marker-end", "url(#end)")
+		.attr("class", "link")
+		.style("fill","none")
+		.style("stroke-width",nominal_stroke)
+		.style("stroke", function(d) { return css[d.type]; });
+
+	// define the nodes
+	var node = svg.selectAll(".node")
+		.data(force.nodes())
+	  .enter().append("g")
+		.attr("class", "node")
+		.on("click", click)
+		.on("dblclick", dblclick)
+		.call(force.drag);
+
+	// add the nodes
+	node.append("circle")
+		.attr("r", 5)
+		.attr("style", "fill:#ccc;stroke:#fff;stroke-width:1.5px");
+
+	// add the text 
+	node.append("text")
+		.attr("x", 12)
+		.attr("dy", ".35em")
+		.attr("style", "fill:#000;font:10px sans-serif;pointer-events:none")
+		.text(function(d) { return d.name; });
+	
+	var text = node.selectAll("text")
+		.style("font-size", nominal_text_size + "px");
+	
+	// add the curvy lines
+	function tick() {
+		path.attr("d", function(d) {
+			var dx = d.target.x - d.source.x,
+				dy = d.target.y - d.source.y,
+				dr = Math.sqrt(dx * dx + dy * dy);
+			return "M" + 
+				d.source.x + "," + 
+				d.source.y + "A" + 
+				dr + "," + dr + " 0 0,1 " + 
+				d.target.x + "," + 
+				d.target.y;
+		});
+
+		node
+			.attr("transform", function(d) { 
+				return "translate(" + d.x + "," + d.y + ")"; });
+	}
+	
+	// add legend
+	var legendData = [
+		{pos:0, type:"twofive", value:threshold+" < x < "+v.invert(25).toFixed(2)},
+		{pos:1, type:"fivezero", value:v.invert(25).toFixed(2)+" < x < "+v.invert(50).toFixed(2)},
+		{pos:2, type:"sevenfive", value:v.invert(50).toFixed(2)+" < x < "+v.invert(75).toFixed(2)},
+		{pos:3, type:"onezerozero", value:v.invert(75).toFixed(2)+" < x < "+v.invert(100).toFixed(2)},
+	];
+	
+	svg.append("svg:g").selectAll("path")
+		.attr("class", "legend")
+		.data(legendData)
+	  .enter().append("svg:path")    // This section adds in the arrows
+		.attr("style", function(d){
+			return "fill:none;stroke-width:1.5px;stroke:" + css[d.type];
+		})
+		.attr("d", function(d){
+			var position = 20 + (d.pos*20);
+			return "M 10 "+position+" l 25 0";
+		});
+	svg.append("svg:g").selectAll("text")
+		.attr("class", "legend")
+		.data(legendData)
+	  .enter().append("svg:text")
+		.attr("x", "45")
+		.attr("y", function(d){
+			return 25 + (d.pos*20);
+		})
+		.attr("style", "fill:#000;font:10px sans-serif;pointer-events:none")
+		.text(function(d){
+			return d.value;
+		});
+		
+	
+	var tocolor = "fill";
+	var towhite = "stroke";
+	if (outline) {
+		tocolor = "stroke"
+		towhite = "fill"
+	}
+	
+	var circle = node.append("path")
+      .attr("d", d3.svg.symbol()
+        //.size(function(d) { return Math.PI*Math.pow(size(d.size)||nominal_base_node_size,2); })
+        .type(function(d) { return d.type; }))
+	.style(tocolor, function(d) { 
+		if (isNumber(d.score) && d.score>=0) return color(d.score);
+		else return default_node_color; 
+	})
+    //.attr("r", function(d) { return size(d.size)||nominal_base_node_size; })
+	.style("stroke-width", nominal_stroke)
+	.style(towhite, "white");
+	
+	node.on("mouseover", function(d) {
+		set_highlight(d);
+		})
+		.on("mousedown", function(d) { d3.event.stopPropagation();
+			focus_node = d;
+			set_focus(d)
+			if (highlight_node === null) set_highlight(d)
+		
+		})
+		.on("mouseout", function(d) {
+			exit_highlight();
+		});
+
+	d3.select(window).on("mouseup",  
+		function() {
+			if (focus_node!==null){
+				focus_node = null;
+				if (highlight_trans<1){
+					circle.style("opacity", 1);
+					text.style("opacity", 1);
+					path.style("opacity", 1);
+				}
+			}
+			if (highlight_node === null) exit_highlight();
+		});
+		
+	function exit_highlight(){
+		highlight_node = null;
+		if (focus_node===null){
+			//svg.style("cursor","move");
+			if (highlight_color!="white"){
+				circle.style(towhite, "white");
+				text.style("font-weight", "normal");
+				//path.style("stroke", function(o) {return (isNumber(o.score) && o.score>=0)?color(o.score):default_link_color});
+			}
+		}
+	}
+
+	function set_focus(d){	
+		if (highlight_trans<1){
+			circle.style("opacity", function(o) {
+				return isConnected(d, o) ? 1 : highlight_trans;
+			});
+
+			text.style("opacity", function(o) {
+				return isConnected(d, o) ? 1 : highlight_trans;
+			});
+			path.style("opacity", function(o) {
+				//return o.source.index == d.index || o.target.index == d.index ? 1 : highlight_trans;
+				return o.target.index == d.index ? 1 : highlight_trans;
+			});		
+		}
+	}
+
+
+	function set_highlight(d){
+		//svg.style("cursor","pointer");
+		if (focus_node!==null) d = focus_node;
+		highlight_node = d;
+
+		if (highlight_color!="white"){
+			  circle.style(towhite, function(o) {
+					return isConnected(d, o) ? highlight_color : "white";});
+				text.style("font-weight", function(o) {
+					return isConnected(d, o) ? "bold" : "normal";});
+				//path.style("stroke", function(o) {
+				//  return o.source.index == d.index || o.target.index == d.index ? highlight_color : ((isNumber(o.score) && o.score>=0)?color(o.score):default_link_color);
+				//});
+		}
+	}
+};	
+
+
+ 	
+
+	
+// action to take on mouse click
+function click() {
+    d3.select(this).select("text").transition()
+        .duration(750)
+     d3.select(this).select("circle").transition()
+        .duration(750)
+}
+
+// action to take on mouse double click
+function dblclick() {
+    d3.select(this).select("circle").transition()
+        .duration(750)
+    d3.select(this).select("text").transition()
+        .duration(750)
+}
+
+$( "form" ).change(function( event ) {
+	var inthreshold = $( "input#thresholdValueIn" ).val();
+	inthreshold = inthreshold/100;
+	threshold = inthreshold;
+	
+	linkDistanceValue = $( "input#linkValueIn" ).val();
+		
+	chargeValue = $( "input#chargeValueIn" ).val()*(-1);
+	
+	$( "svg#graphResult").remove();
+	draw();
+    return false;
+});
+
+function updateTextThreshold(val) {
+	val = val/100;
+	document.getElementById("thresholdText").value=val; 
+}
+
+function download(){
+	//get svg element.
+	var svg = document.getElementById("graphResult");
+
+	//get svg source.
+	var serializer = new XMLSerializer();
+	var source = serializer.serializeToString(svg);
+
+	//add name spaces.
+	if(!source.match(/^<svg[^>]+xmlns="http\:\/\/www\.w3\.org\/2000\/svg"/)){
+		source = source.replace(/^<svg/, \'<svg xmlns="http://www.w3.org/2000/svg"\');
+	}
+	if(!source.match(/^<svg[^>]+"http\:\/\/www\.w3\.org\/1999\/xlink"/)){
+		source = source.replace(/^<svg/, \'<svg xmlns:xlink="http://www.w3.org/1999/xlink"\');
+	}
+
+	//add xml declaration
+	source = \'<?xml version="1.0" standalone="no"?>\r\n\' + source;
+
+	//convert svg source to URI data scheme.
+	var url = "data:image/svg+xml;charset=utf-8,"+encodeURIComponent(source);
+
+	//set url value to a element\'s href attribute.
+	window.open(url, \'_blank\');
+	//you can download svg file by right click menu.
+}
+
+function isNumber(n) {
+  return !isNaN(parseFloat(n)) && isFinite(n);
+}	
+//});
+
+</script>
+</body>
+</html>
+';
+#}
+
+
+=head1 NAME
+
+ELDOgraph - External Least Divergent Ortholog graph
+
+=head1 SYNOPSIS
+
+./eldograph_analyse -hashfile <hash_file> -rank <rank_code>
+
+=item B<Other parameters>:
+
+[-out file_name] [-threshold (0 to 1)]
+		
+=item B<Help>:
+
+[-help] [-man] [-version]
+
+Use -man for a detailed help.
+
+=head1 OPTIONS
+
+=over 8
+
+=item B<-treedir> <tree_directory>
+
+A path for a folder with the gene trees.
+
+=item B<-rank> <rank_code>
+
+A taxonomic rank in which the analysis will be performed. 
+It should be a number between 1 to 17 or a taxonomic rank name. All 
+valid taxonomic ranks and their codes are as follow:
+"superkingdom" => 1,
+"kingdom" => 2,
+"phylum" => 3,
+"subphylum" => 4,
+"superclass" => 5,
+"class" => 6,
+"subclass" => 7,
+"superorder" => 8,
+"order" => 9,
+"suborder" => 10,
+"superfamily" => 11,
+"family" => 12,
+"subfamily" => 13,
+"genus" => 14,
+"subgenus" => 15,
+"species" => 16,
+"subspecies" => 17
+
+=item B<-threshold> <0 to 1> Default: 0
+
+A fraction of the shortest branch length to be used as a parameter to 
+consider more than one sample as ELDO. If the difference between the 
+branch length of a sample with the shortest branch length is shorter 
+than the fraction of the shortest branch length, this sample will also 
+be considered as ELDO.
+
+=item B<-out> <file_name> Default: "eldo_result"
+
+Prefix for output files.
+
+=item B<-version>
+
+Print ELDOgraph version.
+
+=item B<-help>
+
+Print a brief help message and exits.
+
+=item B<-man>
+
+Prints the manual page and exits.
+
+=back
+
+=head1 DESCRIPTION
+
+B<ELDOgraph> is a tool for comparative genomics analysis that assesses the species relationship considering the phylogenetic distance provided by several gene trees. 
+
+=cut
